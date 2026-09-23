@@ -1,0 +1,26 @@
+# ---- 凭据 / 本机配置（绝不要提交） ----
+keystore.properties
+*.jks
+*.keystore
+local.properties
+
+# ---- 构建产物 ----
+build/
+.gradle/
+.kotlin/
+captures/
+*.iml
+.idea/
+.cxx/
+
+# 调试包体积大且随时可重建；正式包按需保留
+EnglishPod-*-debug.apk
+
+# ---- 工具生成的临时目录 ----
+.mimosa/
+mimosa-report*/
+
+# ---- 系统垃圾文件 ----
+.DS_Store
+Thumbs.db
+*.log

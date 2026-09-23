@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">English Pod</string>
+    <string name="playback_channel_name">播放控制</string>
+    <string name="playback_channel_desc">后台播放英语播客课程</string>
+</resources>
