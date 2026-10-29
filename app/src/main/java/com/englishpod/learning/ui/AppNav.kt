@@ -62,6 +62,7 @@ import com.englishpod.learning.ui.mine.SettingsScreen
 import com.englishpod.learning.ui.quiz.QuizScreen
 import com.englishpod.learning.ui.review.ReviewScreen
 import com.englishpod.learning.ui.stats.StatsScreen
+import com.englishpod.learning.ui.vocabtest.VocabTestScreen
 import com.englishpod.learning.ui.wordbook.WordbookScreen
 
 object Routes {
@@ -76,6 +77,7 @@ object Routes {
     const val SETTINGS = "settings"
     const val NOTES = "notes"
     const val DICTATION = "dictation"
+    const val VOCAB_TEST = "vocabtest"
 
     /** Route patterns registered with the NavHost. */
     const val QUIZ_PATTERN = "quiz?mode={mode}"
@@ -166,6 +168,7 @@ fun AppRoot() {
             composable(Routes.DOWNLOADS) { DownloadsScreen(navController) }
             composable(Routes.SETTINGS) { SettingsScreen(navController) }
             composable(Routes.NOTES) { NotesScreen(navController) }
+            composable(Routes.VOCAB_TEST) { VocabTestScreen(navController) }
             composable(Routes.COURSE_PATTERN) { entry ->
                 CourseScreen(
                     navController = navController,

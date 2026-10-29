@@ -360,6 +360,160 @@ fun StatsScreen(navController: NavHostController) {
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
+                            text = "复习评级分布",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "全部复习轮次里四档反馈的占比，认识越多说明 SRS 在推进。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        val gradeTotals = remember(stats) {
+                            val totals = mutableMapOf<String, Int>()
+                            stats.days.values.forEach { day ->
+                                day.gradeCounts.forEach { (grade, count) ->
+                                    totals[grade] = (totals[grade] ?: 0) + count
+                                }
+                            }
+                            listOf(
+                                "AGAIN" to "不认识",
+                                "HARD" to "模糊",
+                                "GOOD" to "认识",
+                                "EASY" to "简单",
+                            ).map { (key, label) ->
+                                Triple(key, label, totals[key] ?: 0)
+                            }
+                        }
+                        val reviewTotal = gradeTotals.sumOf { it.third }.coerceAtLeast(1)
+
+                        gradeTotals.forEach { (key, label, count) ->
+                            val color = when (key) {
+                                "AGAIN" -> MaterialTheme.colorScheme.error
+                                "HARD" -> MaterialTheme.colorScheme.tertiary
+                                "GOOD" -> MaterialTheme.colorScheme.secondary
+                                else -> MaterialTheme.colorScheme.primary
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(vertical = 3.dp),
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    modifier = Modifier.width(56.dp),
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(10.dp)
+                                        .clip(RoundedCornerShape(50))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth((count.toFloat() / reviewTotal).coerceIn(0f, 1f))
+                                            .height(10.dp)
+                                            .clip(RoundedCornerShape(50))
+                                            .background(color),
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "$count",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "未来 7 天到期预测",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        val forecast = remember(words) {
+                            val now = System.currentTimeMillis()
+                            val dayMs = 24 * 60 * 60 * 1000L
+                            val startOfDay = java.time.LocalDate.now()
+                                .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                            List(7) { dayOffset ->
+                                val from = startOfDay + dayOffset * dayMs
+                                val to = from + dayMs
+                                words.count { it.dueAt in from until to && !it.mastered }
+                            }
+                        }
+                        val maxDue = forecast.maxOrNull()?.coerceAtLeast(1) ?: 1
+                        val barColor = MaterialTheme.colorScheme.primary
+                        val emptyColor = MaterialTheme.colorScheme.surfaceVariant
+
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(110.dp),
+                        ) {
+                            val labelSpace = 18.dp.toPx()
+                            val chartHeight = size.height - labelSpace
+                            val slot = size.width / forecast.size
+                            val barWidth = slot * 0.5f
+                            forecast.forEachIndexed { i, count ->
+                                val barHeight = (chartHeight * count.toFloat() / maxDue).coerceAtLeast(3f)
+                                drawRoundRect(
+                                    color = if (count > 0) barColor else emptyColor,
+                                    topLeft = Offset(i * slot + (slot - barWidth) / 2f, chartHeight - barHeight),
+                                    size = Size(barWidth, barHeight),
+                                    cornerRadius = CornerRadius(barWidth / 3f, barWidth / 3f),
+                                )
+                            }
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            listOf("今", "明", "后", "3", "4", "5", "6").forEach { label ->
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "明天到期 ${forecast.getOrElse(1) { 0 }} 个 · 本周共 ${forecast.sum()} 个",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            item {
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
                             text = "今日进度",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,

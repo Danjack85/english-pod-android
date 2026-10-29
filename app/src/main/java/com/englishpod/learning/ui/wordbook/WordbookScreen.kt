@@ -1,5 +1,6 @@
 package com.englishpod.learning.ui.wordbook
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +23,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
@@ -87,6 +89,36 @@ fun WordbookScreen(navController: NavHostController) {
     var addDialog by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<WordEntry?>(null) }
     var playingKey by remember { mutableStateOf<String?>(null) }
+    val context2 = LocalContext.current
+
+    val ankiExportLauncher = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.CreateDocument("text/tab-separated-values"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val body = buildString {
+            appendLine("#separator:tab")
+            appendLine("#html:false")
+            appendLine("#tags column:5")
+            appendLine("term\tdefinition\tlevel\tcourse\ttags")
+            words.forEach { word ->
+                val tags = buildList {
+                    if (word.isLeech) add("leech")
+                    if (word.mastered) add("mastered")
+                }.joinToString(" ")
+                fun esc(value: String) = value.replace('\t', ' ').replace('\n', ' ')
+                appendLine(
+                    "${esc(word.term)}\t${esc(word.definition)}\t${esc(word.level)}\t" +
+                        "${esc(word.courseTitle)}\t$tags",
+                )
+            }
+        }
+        val ok = runCatching {
+            context2.contentResolver.openOutputStream(uri)?.use { it.write(body.toByteArray()) }
+        }.isSuccess
+        scope.launch {
+            snackbarHostState.showSnackbar(if (ok) "已导出 Anki 可导入的 TSV" else "导出失败")
+        }
+    }
 
     val clipPlayer = remember { ClipPlayer(context) }
     DisposableEffect(Unit) {
@@ -120,6 +152,7 @@ fun WordbookScreen(navController: NavHostController) {
                 when (filter) {
                     1 -> it.dueAt <= now && !it.mastered
                     2 -> it.mastered
+                    3 -> it.isLeech
                     else -> true
                 }
             }
@@ -137,6 +170,11 @@ fun WordbookScreen(navController: NavHostController) {
             TopAppBar(
                 title = { Text("生词本", fontWeight = FontWeight.Bold) },
                 actions = {
+                    IconButton(onClick = {
+                        ankiExportLauncher.launch("english-pod-anki.tsv")
+                    }) {
+                        Icon(Icons.Filled.FileDownload, contentDescription = "导出 Anki TSV")
+                    }
                     IconButton(onClick = { navController.navigate(Routes.dictation("word")) }) {
                         Icon(Icons.Filled.RecordVoiceOver, contentDescription = "单词听写")
                     }
@@ -194,11 +232,19 @@ fun WordbookScreen(navController: NavHostController) {
                 modifier = Modifier.padding(horizontal = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                listOf("全部", "待复习", "已掌握").forEachIndexed { index, label ->
+                listOf("全部", "待复习", "已掌握", "难词").forEachIndexed { index, label ->
                     FilterChip(
                         selected = filter == index,
                         onClick = { filter = index },
-                        label = { Text(label) },
+                        label = {
+                            Text(
+                                if (index == 3) {
+                                    "难词 ${words.count { w -> w.isLeech }}"
+                                } else {
+                                    label
+                                },
+                            )
+                        },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                         ),
@@ -225,14 +271,23 @@ fun WordbookScreen(navController: NavHostController) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(visible, key = { it.key }) { word ->
+                        val dictEntry = remember(word.key) {
+                            com.englishpod.learning.EnglishPodApp.dict.lookup(word.term)
+                        }
                         WordCard(
                             word = word,
                             due = word.dueAt <= now && !word.mastered,
+                            band = dictEntry?.band,
                             playing = playingKey == word.key && clipPlayer.playing.collectAsStateWithLifecycle().value,
                             onPlayAudio = if (word.start != null && word.courseId != "manual") {
                                 { playWord(word) }
                             } else {
-                                null
+                                {
+                                    playingKey = word.key
+                                    com.englishpod.learning.EnglishPodApp.tts.speak(word.term) {
+                                        playingKey = null
+                                    }
+                                }
                             },
                             onPlayInCourse = {
                                 navController.navigate(Routes.course(word.courseId))
@@ -305,6 +360,7 @@ private fun SummaryCell(label: String, value: Int) {
 private fun WordCard(
     word: WordEntry,
     due: Boolean,
+    band: String?,
     playing: Boolean,
     onPlayAudio: (() -> Unit)?,
     onPlayInCourse: () -> Unit,
@@ -350,6 +406,34 @@ private fun WordCard(
                         ) {
                             Text(
                                 text = "已掌握",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                            )
+                        }
+                    }
+                    if (word.isLeech) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                            shape = RoundedCornerShape(6.dp),
+                        ) {
+                            Text(
+                                text = "难词",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                            )
+                        }
+                    }
+                    if (band != null) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            shape = RoundedCornerShape(6.dp),
+                        ) {
+                            Text(
+                                text = band,
                                 style = MaterialTheme.typography.labelSmall,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
                             )

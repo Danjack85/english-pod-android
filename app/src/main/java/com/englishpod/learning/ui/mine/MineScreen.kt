@@ -86,6 +86,7 @@ import com.englishpod.learning.data.CourseApi
 import com.englishpod.learning.data.Settings
 import com.englishpod.learning.player.AudioEngine
 import com.englishpod.learning.ui.Routes
+import com.englishpod.learning.work.ReminderWorker
 import com.englishpod.learning.ui.components.CourseCard
 import com.englishpod.learning.ui.components.EmptyState
 import kotlinx.coroutines.launch
@@ -788,6 +789,77 @@ fun SettingsScreen(navController: NavHostController) {
                 checked = settings.rewindOnResume,
                 onCheckedChange = { value -> store.updateSettings { it.copy(rewindOnResume = value) } },
             )
+
+            SettingsSection(title = "学习提醒")
+
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "每日复习提醒",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = "到点通知今天有几个生词待复习",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = settings.reminderEnabled,
+                            onCheckedChange = { enabled ->
+                                store.updateSettings { it.copy(reminderEnabled = enabled) }
+                                if (enabled) {
+                                    val slot = Settings.REMINDER_SLOTS[
+                                        settings.reminderSlot.coerceIn(0, Settings.REMINDER_SLOTS.lastIndex),
+                                    ]
+                                    ReminderWorker.schedule(context, slot.first, slot.second)
+                                } else {
+                                    ReminderWorker.cancel(context)
+                                }
+                            },
+                        )
+                    }
+
+                    if (settings.reminderEnabled) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Settings.REMINDER_SLOTS.forEachIndexed { index, (hour, minute) ->
+                                val label = "%02d:%02d".format(hour, minute)
+                                FilterChip(
+                                    selected = settings.reminderSlot == index,
+                                    onClick = {
+                                        store.updateSettings { it.copy(reminderSlot = index) }
+                                        ReminderWorker.schedule(context, hour, minute)
+                                    },
+                                    label = { Text(label) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    ),
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "提醒时间可能有一点偏差，属系统调度正常行为。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
 
             SettingsSection(title = "数据")
 

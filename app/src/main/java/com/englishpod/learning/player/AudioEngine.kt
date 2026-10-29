@@ -1,6 +1,7 @@
 package com.englishpod.learning.player
 
 import android.content.Context
+import android.media.audiofx.LoudnessEnhancer
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -43,13 +44,21 @@ data class PlayerState(
     val sleepRemainingSec: Int = -1,
     val sentenceMode: Boolean = false,
     val skipSilence: Boolean = false,
+    val volumeBoost: Boolean = false,
+    /** How many times the current sentence should loop: 0 = forever. */
+    val repeatTarget: Int = 0,
+    /** Loops already played of the current sentence. */
+    val repeatDone: Int = 0,
     val error: String? = null,
     val ready: Boolean = false,
     val finished: Boolean = false,
 ) {
     val cueLabel: String
         get() = when {
-            loopMode == LoopMode.SENTENCE && sentenceLoopIndex >= 0 -> "单句循环 · 第 ${sentenceLoopIndex + 1} 句"
+            loopMode == LoopMode.SENTENCE && sentenceLoopIndex >= 0 -> {
+                val progress = if (repeatTarget > 0) " · ${repeatDone + 1}/$repeatTarget 遍" else ""
+                "单句循环 · 第 ${sentenceLoopIndex + 1} 句$progress"
+            }
             loopMode == LoopMode.AB && abEndMs > abStartMs -> "A-B 复读 ${Fmt.clock(abStartMs)} - ${Fmt.clock(abEndMs)}"
             sentenceMode -> "逐句精听"
             else -> "连续播放"
@@ -72,6 +81,7 @@ object AudioEngine {
 
     private const val RESUME_REWIND_MS = 3_000L
     private const val RESUME_REWIND_MIN_PAUSE_MS = 5_000L
+    private const val BOOST_GAIN_MB = 4_000
 
     private var cues: List<Cue> = emptyList()
     private var ticker: Job? = null
@@ -83,6 +93,7 @@ object AudioEngine {
     private var pausedBySentence = false
     private var autoAdvanceSuppressed = false
     private var lastPauseAt = 0L
+    private var enhancer: LoudnessEnhancer? = null
 
     fun init(context: Context, localStore: LocalStore) {
         if (player != null) return
@@ -127,9 +138,13 @@ object AudioEngine {
                 })
             }
         player?.setSkipSilenceEnabled(localStore.settings.value.skipSilence)
+        if (localStore.settings.value.volumeBoost) attachBoost()
     }
 
     private fun requirePlayer(): ExoPlayer? = player
+
+    /** The underlying ExoPlayer, exposed so the MediaSession service can wrap it. */
+    fun currentExoPlayer(): ExoPlayer? = player
 
     // -------------------------------------------------------------------- loading
 
@@ -154,6 +169,9 @@ object AudioEngine {
             durationMs = detail.course.durationMs,
             speed = store?.settings?.value?.speed ?: 1f,
             cueIndex = indexAt(startAtMs.toDouble() / 1000.0),
+            skipSilence = store?.settings?.value?.skipSilence ?: false,
+            volumeBoost = store?.settings?.value?.volumeBoost ?: false,
+            repeatTarget = store?.settings?.value?.sentenceRepeatCount ?: 0,
             ready = false,
         )
 
@@ -210,6 +228,34 @@ object AudioEngine {
         _state.value = _state.value.copy(skipSilence = enabled)
     }
 
+    /** Loudness boost for quiet recordings; persisted in settings. */
+    fun setVolumeBoost(enabled: Boolean) {
+        store?.updateSettings { it.copy(volumeBoost = enabled) }
+        _state.value = _state.value.copy(volumeBoost = enabled)
+        if (enabled) attachBoost() else detachBoost()
+    }
+
+    private fun attachBoost() {
+        val exo = player ?: return
+        if (enhancer != null) return
+        try {
+            val effect = LoudnessEnhancer(exo.audioSessionId)
+            effect.setTargetGain(BOOST_GAIN_MB)
+            effect.enabled = true
+            enhancer = effect
+        } catch (_: Exception) {
+            enhancer = null
+        }
+    }
+
+    private fun detachBoost() {
+        runCatching {
+            enhancer?.enabled = false
+            enhancer?.release()
+        }
+        enhancer = null
+    }
+
     fun seekTo(positionMs: Long) {
         val exo = requirePlayer() ?: return
         val target = positionMs.coerceIn(0L, maxOf(0L, exo.duration))
@@ -257,7 +303,7 @@ object AudioEngine {
         val target = (cue.start * 1000).toLong()
         seekTo(target)
         if (_state.value.loopMode == LoopMode.SENTENCE) {
-            _state.value = _state.value.copy(sentenceLoopIndex = index)
+            _state.value = _state.value.copy(sentenceLoopIndex = index, repeatDone = 0)
         }
         if (play) play()
     }
@@ -269,10 +315,18 @@ object AudioEngine {
         _state.value = _state.value.copy(
             loopMode = mode,
             sentenceLoopIndex = if (mode == LoopMode.SENTENCE) maxOf(index, 0) else -1,
+            repeatDone = 0,
+            repeatTarget = store?.settings?.value?.sentenceRepeatCount ?: _state.value.repeatTarget,
         )
         if (mode == LoopMode.SENTENCE) {
             playSentence(maxOf(index, 0))
         }
+    }
+
+    /** Sets how many times each sentence loops before moving on; 0 keeps looping forever. */
+    fun setRepeatCount(count: Int) {
+        store?.updateSettings { it.copy(sentenceRepeatCount = count) }
+        _state.value = _state.value.copy(repeatTarget = count, repeatDone = 0)
     }
 
     fun setSentenceLoop(index: Int) {
@@ -345,6 +399,7 @@ object AudioEngine {
         ticker?.cancel()
         autoAdvance?.cancel()
         sleepJob?.cancel()
+        detachBoost()
         player?.release()
         player = null
     }
@@ -420,7 +475,27 @@ object AudioEngine {
             state.loopMode == LoopMode.SENTENCE -> {
                 val loopCue = cues.getOrNull(state.sentenceLoopIndex) ?: cue
                 val end = (loopCue.end * 1000).toLong()
-                if (position >= end) exo.seekTo((loopCue.start * 1000).toLong())
+                if (position >= end) {
+                    val done = state.repeatDone + 1
+                    val target = state.repeatTarget
+                    if (target > 0 && done >= target) {
+                        // Finished the requested number of repeats: move on or wait in drill mode.
+                        val nextIndex = state.sentenceLoopIndex + 1
+                        _state.value = _state.value.copy(repeatDone = 0)
+                        when {
+                            cues.getOrNull(nextIndex) == null -> exo.pause()
+                            state.sentenceMode -> {
+                                pausedBySentence = true
+                                exo.pause()
+                                scheduleAdvance(state.sentenceLoopIndex)
+                            }
+                            else -> playSentence(nextIndex)
+                        }
+                    } else {
+                        _state.value = _state.value.copy(repeatDone = done)
+                        exo.seekTo((loopCue.start * 1000).toLong())
+                    }
+                }
             }
 
             state.loopMode == LoopMode.AB && state.abEndMs > state.abStartMs -> {

@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -49,6 +50,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -71,6 +73,7 @@ private data class WordSelection(
     val definition: String,
     val cue: Cue,
     val known: Boolean,
+    val dict: com.englishpod.learning.data.DictEntry? = null,
 )
 
 private val punctuation = ".,!?;:\"“”'’()[]{}<>…—–-"
@@ -246,6 +249,7 @@ fun TranscriptPane(
                                                     definition = match?.definition.orEmpty(),
                                                     cue = cue,
                                                     known = match != null,
+                                                    dict = com.englishpod.learning.EnglishPodApp.dict.lookup(word),
                                                 )
                                             },
                                         )
@@ -289,8 +293,16 @@ private fun WordDialog(
     onLoop: () -> Unit,
     onCopy: () -> Unit,
 ) {
-    var definition by remember(selection.word) { mutableStateOf(selection.definition) }
+    val dict = selection.dict
+    var definition by remember(selection.word) {
+        mutableStateOf(
+            selection.definition.ifBlank {
+                dict?.translation?.lineSequence()?.firstOrNull().orEmpty()
+            },
+        )
+    }
     val clipboard = LocalClipboardManager.current
+    val ttsState by com.englishpod.learning.EnglishPodApp.tts.state.collectAsStateWithLifecycle()
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -307,8 +319,62 @@ private fun WordDialog(
         },
         text = {
             Column {
+                if (dict != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (!dict.phonetic.isNullOrBlank()) {
+                            Text(
+                                text = "/${dict.phonetic}/",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                        dict.badges.take(3).forEach { badge ->
+                            Text(
+                                text = badge,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(end = 6.dp),
+                            )
+                        }
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(onClick = {
+                            com.englishpod.learning.EnglishPodApp.tts.speak(selection.word)
+                        }) {
+                            Icon(
+                                Icons.Filled.VolumeUp,
+                                contentDescription = "朗读单词",
+                                tint = MaterialTheme.colorScheme.secondary,
+                            )
+                        }
+                    }
+                    if (!dict.translation.isNullOrBlank()) {
+                        Text(
+                            text = dict.translation.lineSequence().take(4).joinToString("；"),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                }
+
+                if (ttsState.status == com.englishpod.learning.player.TtsPlayer.Status.NEEDS_VOICE_DATA) {
+                    Text(
+                        text = "手机还没有英语语音包：系统设置 → 辅助功能 → 文字转语音（TTS）里安装",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+
                 Text(
-                    text = if (selection.known) "课程词汇释义" else "课程词汇未收录，可补充自己的释义",
+                    text = if (selection.known) {
+                        "课程词汇释义"
+                    } else if (dict != null) {
+                        "来自离线词典，可修改后收藏"
+                    } else {
+                        "词典未收录，可补充自己的释义"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

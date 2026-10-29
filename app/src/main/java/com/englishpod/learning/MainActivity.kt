@@ -1,6 +1,7 @@
 package com.englishpod.learning
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -13,8 +14,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.glance.appwidget.updateAll
 import com.englishpod.learning.ui.AppRoot
 import com.englishpod.learning.ui.theme.EnglishPodTheme
+import com.englishpod.learning.widget.StatsWidget
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -28,6 +33,7 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             runCatching { notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }
         }
+        consumeAutoResumeIntent(intent)
 
         setContent {
             val settings by EnglishPodApp.store.settings.collectAsStateWithLifecycle()
@@ -49,8 +55,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        consumeAutoResumeIntent(intent)
+    }
+
+    private fun consumeAutoResumeIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_AUTO_RESUME, false) == true) {
+            EnglishPodApp.instance.autoResumeRequested = true
+        }
+    }
+
     override fun onStop() {
         super.onStop()
         EnglishPodApp.store.flushNow()
+        // Keep the home-screen widget in sync with today's numbers.
+        lifecycleScope.launch {
+            runCatching { StatsWidget().updateAll(this@MainActivity) }
+        }
+    }
+
+    companion object {
+        const val EXTRA_AUTO_RESUME = "auto_resume"
     }
 }

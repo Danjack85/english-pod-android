@@ -1,204 +1,136 @@
 package com.englishpod.learning.player
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
-import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.os.IBinder
-import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
+import android.os.Bundle
+import android.view.KeyEvent
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
 import com.englishpod.learning.MainActivity
-import com.englishpod.learning.R
-import com.englishpod.learning.core.Fmt
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.launch
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 
 /**
- * Foreground service that keeps audio playing while the app is in the background and mirrors the
- * player state into a notification with transport controls.
+ * Media3 session service wrapping the shared [AudioEngine] player.
+ *
+ * The platform media notification (lock screen seek bar, resumption card) and media button
+ * routing (Bluetooth / wired headset) come for free; the sentence-skip buttons are exposed
+ * through the session's custom layout so they appear in the media notification.
  */
-class PlaybackService : Service() {
+@UnstableApi
+class PlaybackService : MediaSessionService() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private var watcher: Job? = null
-    private var foreground = false
-
-    override fun onBind(intent: Intent?): IBinder? = null
+    private var mediaSession: MediaSession? = null
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_TOGGLE -> AudioEngine.togglePlay()
-            ACTION_NEXT -> AudioEngine.nextSentence()
-            ACTION_PREV -> AudioEngine.previousSentence()
-            ACTION_STOP -> {
-                AudioEngine.pause()
-                stopPlaybackService(this)
-                return START_NOT_STICKY
-            }
-            else -> Unit
-        }
-
-        if (AudioEngine.state.value.courseId == null) {
+        val player: ExoPlayer = AudioEngine.currentExoPlayer() ?: run {
             stopSelf()
-            return START_NOT_STICKY
+            return
         }
 
-        startForegroundSafely(AudioEngine.state.value)
-        if (watcher?.isActive != true) {
-            watcher = scope.launch {
-                AudioEngine.state.collect { state ->
-                    if (state.courseId == null) {
-                        stopPlaybackService(this@PlaybackService)
-                        return@collect
-                    }
-                    if (foreground) notify(build(state))
+        val prevCommand = SessionCommand(COMMAND_PREV_SENTENCE, Bundle.EMPTY)
+        val nextCommand = SessionCommand(COMMAND_NEXT_SENTENCE, Bundle.EMPTY)
+
+        val callback = object : MediaSession.Callback {
+            override fun onCustomCommand(
+                session: MediaSession,
+                controller: MediaSession.ControllerInfo,
+                customCommand: SessionCommand,
+                args: Bundle,
+            ): ListenableFuture<SessionResult> {
+                when (customCommand.customAction) {
+                    COMMAND_PREV_SENTENCE -> AudioEngine.previousSentence()
+                    COMMAND_NEXT_SENTENCE -> AudioEngine.nextSentence()
                 }
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+
+            // Headset / Bluetooth buttons: sentence skip is far more useful than item skip
+            // because the app plays a single media item per course.
+            override fun onMediaButtonEvent(
+                mediaSession: MediaSession,
+                controller: MediaSession.ControllerInfo,
+                intent: Intent,
+            ): Boolean {
+                val event = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                when (event?.keyCode) {
+                    KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                        AudioEngine.previousSentence()
+                        return true
+                    }
+                    KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                        AudioEngine.nextSentence()
+                        return true
+                    }
+                }
+                return super.onMediaButtonEvent(mediaSession, controller, intent)
             }
         }
-        return START_STICKY
-    }
 
-    override fun onDestroy() {
-        watcher?.cancel()
-        scope.cancel()
-        super.onDestroy()
-    }
-
-    private fun startForegroundSafely(state: PlayerState) {
-        val notification = build(state)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, foregroundServiceType())
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-            foreground = true
-        } catch (_: Exception) {
-            // Ignore: the service will simply not be promoted to foreground.
-        }
-    }
-
-    private fun foregroundServiceType(): Int =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        } else {
-            0
-        }
-
-    private fun notify(notification: Notification) {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        runCatching { manager.notify(NOTIFICATION_ID, notification) }
-    }
-
-    private fun build(state: PlayerState): Notification {
-        val subtitle = buildString {
-            append(state.level.ifBlank { "English Pod" })
-            if (state.positionMs > 0L || state.durationMs > 0L) {
-                append(" · ")
-                append(Fmt.clock(state.positionMs))
-                if (state.durationMs > 0L) append(" / ").append(Fmt.clock(state.durationMs))
-            }
-        }
-        val text = if (state.isPlaying || state.isBuffering) {
-            state.cueLabel
-        } else {
-            "已暂停 · 点击继续"
-        }
-
-        val contentIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(state.title.ifBlank { "English Pod" })
-            .setContentText(text)
-            .setSubText(subtitle)
-            .setStyle(NotificationCompat.BigTextStyle().bigText("$text\n$subtitle"))
-            .setContentIntent(contentIntent)
-            .setOngoing(state.isPlaying)
-            .setOnlyAlertOnce(true)
-            .setShowWhen(false)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .addAction(
-                R.drawable.ic_skip_previous,
-                "上一句",
-                serviceIntent(ACTION_PREV, 1),
+        mediaSession = MediaSession.Builder(this, player)
+            .setSessionActivity(
+                android.app.PendingIntent.getActivity(
+                    this,
+                    0,
+                    Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+                ),
             )
-            .addAction(
-                if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
-                if (state.isPlaying) "暂停" else "播放",
-                serviceIntent(ACTION_TOGGLE, 2),
+            .setCustomLayout(
+                ImmutableList.of(
+                    androidx.media3.session.CommandButton.Builder()
+                        .setDisplayName("上一句")
+                        .setIconResId(com.englishpod.learning.R.drawable.ic_skip_previous)
+                        .setSessionCommand(prevCommand)
+                        .build(),
+                    androidx.media3.session.CommandButton.Builder()
+                        .setDisplayName("下一句")
+                        .setIconResId(com.englishpod.learning.R.drawable.ic_skip_next)
+                        .setSessionCommand(nextCommand)
+                        .build(),
+                ),
             )
-            .addAction(
-                R.drawable.ic_skip_next,
-                "下一句",
-                serviceIntent(ACTION_NEXT, 3),
-            )
-            .addAction(
-                R.drawable.ic_close,
-                "关闭",
-                serviceIntent(ACTION_STOP, 4),
-            )
+            .setCallback(callback)
             .build()
     }
 
-    private fun serviceIntent(action: String, requestCode: Int): PendingIntent =
-        PendingIntent.getService(
-            this,
-            requestCode,
-            Intent(this, PlaybackService::class.java).setAction(action),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
+        mediaSession
 
-    private fun createChannel() {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.playback_channel_name),
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = getString(R.string.playback_channel_desc)
-            setShowBadge(false)
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val player = mediaSession?.player
+        if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
+            stopSelf()
         }
-        manager.createNotificationChannel(channel)
+    }
+
+    override fun onDestroy() {
+        mediaSession?.release()
+        mediaSession = null
+        super.onDestroy()
     }
 
     companion object {
-        const val CHANNEL_ID = "english_pod_playback"
-        const val NOTIFICATION_ID = 4201
-        const val ACTION_TOGGLE = "com.englishpod.learning.TOGGLE"
-        const val ACTION_NEXT = "com.englishpod.learning.NEXT"
-        const val ACTION_PREV = "com.englishpod.learning.PREV"
-        const val ACTION_STOP = "com.englishpod.learning.STOP"
+        const val COMMAND_PREV_SENTENCE = "com.englishpod.learning.PREV_SENTENCE"
+        const val COMMAND_NEXT_SENTENCE = "com.englishpod.learning.NEXT_SENTENCE"
 
-        /** Starts the service when playback begins, so audio survives backgrounding. */
-        fun ensureRunning(context: Context) {
-            val intent = Intent(context, PlaybackService::class.java)
-            runCatching { ContextCompat.startForegroundService(context, intent) }
+        /** Starts the service so the platform media notification and session come up with playback. */
+        fun ensureRunning(context: android.content.Context) {
+            runCatching {
+                androidx.core.content.ContextCompat.startForegroundService(
+                    context,
+                    android.content.Intent(context, PlaybackService::class.java),
+                )
+            }
         }
 
-        fun stopPlaybackService(context: Context) {
-            runCatching { context.stopService(Intent(context, PlaybackService::class.java)) }
+        fun stopPlaybackService(context: android.content.Context) {
+            runCatching { context.stopService(android.content.Intent(context, PlaybackService::class.java)) }
         }
     }
 }

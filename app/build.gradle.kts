@@ -20,8 +20,8 @@ android {
         applicationId = "com.englishpod.learning"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     signingConfigs {
@@ -86,6 +86,10 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.common)
+    implementation(libs.media3.session)
+    implementation(libs.work.runtime.ktx)
+    implementation(libs.glance.appwidget)
+    implementation(libs.glance.material3)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation("junit:junit:4.13.2")

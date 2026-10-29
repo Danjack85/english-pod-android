@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Spellcheck
 import androidx.compose.material.icons.filled.Style
@@ -304,6 +305,14 @@ fun ReviewScreen(navController: NavHostController) {
                 title = "听写训练",
                 subtitle = "听音频写句子、拼单词，练真实听力",
                 onClick = { navController.navigate(Routes.dictation("sentence")) },
+            )
+        }
+        item {
+            OptionCard(
+                icon = Icons.Filled.Insights,
+                title = "词汇量测试",
+                subtitle = "40 题估测词汇规模，可历史对比",
+                onClick = { navController.navigate(Routes.VOCAB_TEST) },
             )
         }
         item {

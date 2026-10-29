@@ -35,8 +35,14 @@ data class WordEntry(
     val key: String get() = term.trim().lowercase()
     val mastered: Boolean get() = box >= MASTERED_BOX
 
+    /** Anki-style leech: keeps slipping back to box 0, deserves focused attention. */
+    val isLeech: Boolean get() = lapses >= LEECH_THRESHOLD
+
     companion object {
         const val MASTERED_BOX = 6
+
+        /** Times a word has been forgotten (graded AGAIN); beyond this it becomes a leech. */
+        const val LEECH_THRESHOLD = 4
     }
 }
 
@@ -61,6 +67,7 @@ data class DayStat(
     val reviews: Int = 0,
     val courses: Set<String> = emptySet(),
     val dictations: Int = 0,
+    val gradeCounts: Map<String, Int> = emptyMap(),
 )
 
 data class StudyStats(val days: Map<String, DayStat> = emptyMap()) {
@@ -109,14 +116,32 @@ data class Settings(
     val subtitleScale: Float = 1f,
     val skipSilence: Boolean = false,
     val rewindOnResume: Boolean = false,
+    val sentenceRepeatCount: Int = 0,
+    val volumeBoost: Boolean = false,
+    val reminderEnabled: Boolean = false,
+    val reminderSlot: Int = 2,
 ) {
     companion object {
         const val DEFAULT_BASE_URL = "https://english.52131415.xyz"
 
         /** Subtitle size presets offered in settings. */
         val SUBTITLE_SCALES = listOf(0.85f, 1f, 1.2f, 1.4f)
+
+        /** Sentence loop repeats: 0 means loop forever. */
+        val REPEAT_COUNTS = listOf(0, 1, 2, 3, 5)
+
+        /** Daily reminder time slots as hour/minute pairs. */
+        val REMINDER_SLOTS = listOf(
+            8 to 0,
+            12 to 30,
+            20 to 0,
+            21 to 30,
+        )
     }
 }
+
+/** One saved result of the vocabulary size estimation test. */
+data class VocabTestResult(val day: String, val estimated: Int)
 
 /**
  * Everything the learner accumulates: favourites, wordbook, playback progress, study statistics
@@ -146,6 +171,9 @@ class LocalStore(context: Context) {
     private val _bookmarks = MutableStateFlow<List<Bookmark>>(emptyList())
     val bookmarks: StateFlow<List<Bookmark>> = _bookmarks.asStateFlow()
 
+    private val _vocabTests = MutableStateFlow<List<VocabTestResult>>(emptyList())
+    val vocabTests: StateFlow<List<VocabTestResult>> = _vocabTests.asStateFlow()
+
     private val _settings = MutableStateFlow(readSettings())
     val settings: StateFlow<Settings> = _settings.asStateFlow()
 
@@ -173,6 +201,10 @@ class LocalStore(context: Context) {
         subtitleScale = prefs.getFloat(KEY_SUBTITLE_SCALE, 1f),
         skipSilence = prefs.getBoolean(KEY_SKIP_SILENCE, false),
         rewindOnResume = prefs.getBoolean(KEY_REWIND, false),
+        sentenceRepeatCount = prefs.getInt(KEY_REPEAT_COUNT, 0),
+        volumeBoost = prefs.getBoolean(KEY_VOLUME_BOOST, false),
+        reminderEnabled = prefs.getBoolean(KEY_REMINDER, false),
+        reminderSlot = prefs.getInt(KEY_REMINDER_SLOT, 2),
     )
 
     fun updateSettings(transform: (Settings) -> Settings) {
@@ -189,6 +221,10 @@ class LocalStore(context: Context) {
             .putFloat(KEY_SUBTITLE_SCALE, next.subtitleScale)
             .putBoolean(KEY_SKIP_SILENCE, next.skipSilence)
             .putBoolean(KEY_REWIND, next.rewindOnResume)
+            .putInt(KEY_REPEAT_COUNT, next.sentenceRepeatCount)
+            .putBoolean(KEY_VOLUME_BOOST, next.volumeBoost)
+            .putBoolean(KEY_REMINDER, next.reminderEnabled)
+            .putInt(KEY_REMINDER_SLOT, next.reminderSlot)
             .apply()
     }
 
@@ -255,7 +291,12 @@ class LocalStore(context: Context) {
                 lastGrade = grade.name,
             )
         }
-        touchDayLocked { it.copy(reviews = it.reviews + 1) }
+        touchDayLocked { day ->
+            day.copy(
+                reviews = day.reviews + 1,
+                gradeCounts = day.gradeCounts + (grade.name to (day.gradeCounts[grade.name] ?: 0) + 1),
+            )
+        }
         writeLocked()
     }
 
@@ -293,6 +334,13 @@ class LocalStore(context: Context) {
     suspend fun recordDictation(count: Int = 1): Unit = locked {
         if (count > 0) touchDayLocked { it.copy(dictations = it.dictations + count) }
         maybeWriteLocked()
+    }
+
+    // ------------------------------------------------------------- vocabulary test
+
+    suspend fun addVocabTest(estimated: Int): Unit = locked {
+        _vocabTests.value = _vocabTests.value + VocabTestResult(Fmt.today(), estimated)
+        writeLocked()
     }
 
     // ------------------------------------------------------------ backup / restore
@@ -387,6 +435,19 @@ class LocalStore(context: Context) {
                     )
                 }
                 _stats.value = StudyStats(days)
+            }
+
+            root.optJSONArray("vocabTests")?.let { array ->
+                val known = _vocabTests.value.map { it.day to it.estimated }.toSet()
+                val merged = _vocabTests.value.toMutableList()
+                for (i in 0 until array.length()) {
+                    val item = array.optJSONObject(i) ?: continue
+                    val result = VocabTestResult(day = item.optString("day"), estimated = item.optInt("estimated"))
+                    if (result.day.isNotBlank() && (result.day to result.estimated) !in known) {
+                        merged.add(result)
+                    }
+                }
+                _vocabTests.value = merged
             }
 
             writeLocked()
@@ -515,10 +576,22 @@ class LocalStore(context: Context) {
                 put("wordsAdded", stat.wordsAdded)
                 put("reviews", stat.reviews)
                 put("dictations", stat.dictations)
+                val grades = JSONObject()
+                stat.gradeCounts.forEach { (grade, count) -> grades.put(grade, count) }
+                put("gradeCounts", grades)
                 put("courses", JSONArray(stat.courses.toList()))
             })
         }
         root.put("stats", days)
+
+        val tests = JSONArray()
+        _vocabTests.value.forEach { result ->
+            tests.put(JSONObject().apply {
+                put("day", result.day)
+                put("estimated", result.estimated)
+            })
+        }
+        root.put("vocabTests", tests)
         return root
     }
 
@@ -598,6 +671,14 @@ class LocalStore(context: Context) {
                         if (value.isNotBlank()) courses.add(value)
                     }
                 }
+                val grades = mutableMapOf<String, Int>()
+                item.optJSONObject("gradeCounts")?.let { gradesJson ->
+                    val keys = gradesJson.keys()
+                    while (keys.hasNext()) {
+                        val grade = keys.next()
+                        grades[grade] = gradesJson.optInt(grade)
+                    }
+                }
                 map[day] = DayStat(
                     day = day,
                     seconds = item.optLong("seconds"),
@@ -605,9 +686,19 @@ class LocalStore(context: Context) {
                     reviews = item.optInt("reviews"),
                     dictations = item.optInt("dictations"),
                     courses = courses,
+                    gradeCounts = grades,
                 )
             }
             _stats.value = StudyStats(map)
+        }
+
+        root.optJSONArray("vocabTests")?.let { array ->
+            val tests = mutableListOf<VocabTestResult>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                tests.add(VocabTestResult(day = item.optString("day"), estimated = item.optInt("estimated")))
+            }
+            _vocabTests.value = tests
         }
     }
 
@@ -642,6 +733,10 @@ class LocalStore(context: Context) {
         const val KEY_SUBTITLE_SCALE = "subtitle_scale"
         const val KEY_SKIP_SILENCE = "skip_silence"
         const val KEY_REWIND = "rewind_on_resume"
+        const val KEY_REPEAT_COUNT = "sentence_repeat_count"
+        const val KEY_VOLUME_BOOST = "volume_boost"
+        const val KEY_REMINDER = "reminder_enabled"
+        const val KEY_REMINDER_SLOT = "reminder_slot"
         const val FLUSH_INTERVAL_MS = 10_000L
 
         /** Review intervals in minutes, indexed by Leitner box. */

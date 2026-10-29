@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -86,16 +87,17 @@ import com.englishpod.learning.data.CourseDetail
 import com.englishpod.learning.player.AudioEngine
 import com.englishpod.learning.player.LoopMode
 import com.englishpod.learning.player.ShadowingRecorder
+import com.englishpod.learning.player.SpeechScorer
 import com.englishpod.learning.ui.components.EmptyState
 import com.englishpod.learning.ui.components.LevelChip
 import com.englishpod.learning.ui.components.LevelPalette
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private val speedOptions = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+private val speedOptions = listOf(0.5f, 0.6f, 0.7f, 0.75f, 0.8f, 0.9f, 1f, 1.1f, 1.25f, 1.5f, 1.75f, 2f)
 
 /** Steps of the shadowing drill. */
-private enum class ShadowPhase { IDLE, LISTEN, RECORD, REVIEW }
+private enum class ShadowPhase { IDLE, LISTEN, RECORD, REVIEW, SCORING }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -121,12 +123,18 @@ fun CourseScreen(navController: NavHostController, courseId: String) {
     var tab by remember { mutableIntStateOf(0) }
     var noteDialog by remember { mutableStateOf(false) }
     var noteDraft by remember { mutableStateOf("") }
+    var autoStartPending by remember { mutableStateOf(false) }
 
     LaunchedEffect(courseId) {
         loading = true
         error = null
         runCatching { repository.detail(courseId) }
-            .onSuccess { detail = it }
+            .onSuccess {
+                detail = it
+                if (EnglishPodApp.consumeAutoResume()) {
+                    autoStartPending = true
+                }
+            }
             .onFailure { error = it.message ?: "课程加载失败，请检查网络" }
         loading = false
     }
@@ -144,6 +152,14 @@ fun CourseScreen(navController: NavHostController, courseId: String) {
             }.onFailure {
                 snackbarHostState.showSnackbar("音频加载失败：${it.message ?: "未知错误"}")
             }
+        }
+    }
+
+    // One-tap resume coming from the home-screen widget.
+    LaunchedEffect(autoStartPending, detail) {
+        if (autoStartPending && detail != null && !isCurrent) {
+            autoStartPending = false
+            startPlayback(null)
         }
     }
 
@@ -453,7 +469,10 @@ fun CourseScreen(navController: NavHostController, courseId: String) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(
+    ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+)
 @Composable
 private fun PlayerPanel(
     detail: CourseDetail,
@@ -487,7 +506,15 @@ private fun PlayerPanel(
     var shadowFile by remember { mutableStateOf<java.io.File?>(null) }
     var shadowIndex by remember { mutableIntStateOf(-1) }
     var shadowBudgetMs by remember { mutableLongStateOf(0L) }
+    var echoActive by remember { mutableStateOf(false) }
+    var speedDialog by remember { mutableStateOf(false) }
+    var repeatMenu by remember { mutableStateOf(false) }
+    var pendingMicAction by remember { mutableIntStateOf(0) }
     val recorder = remember { ShadowingRecorder(context) }
+    val scorer = remember { SpeechScorer(context) }
+    val scoringAvailable = remember { scorer.isAvailable() }
+    val scorerState by scorer.state.collectAsStateWithLifecycle()
+    val panelScope = rememberCoroutineScope()
 
     val shadowCue = detail.cues.getOrNull(shadowIndex)
 
@@ -508,6 +535,7 @@ private fun PlayerPanel(
         }
         shadowIndex = index
         shadowFile = null
+        scorer.reset()
         recorder.stopPlayback()
         AudioEngine.setSentenceMode(true)
         AudioEngine.suppressAutoAdvance(true)
@@ -515,14 +543,61 @@ private fun PlayerPanel(
         shadowPhase = ShadowPhase.LISTEN
     }
 
+    /** Live pronunciation scoring: the recognizer hears the learner repeat the line. */
+    fun startScoring() {
+        val cue = detail.cues.getOrNull(maxOf(playerState.cueIndex, 0)) ?: return
+        if (shadowPhase == ShadowPhase.RECORD) {
+            shadowFile = recorder.stop()
+        }
+        recorder.stopPlayback()
+        AudioEngine.pause()
+        shadowIndex = maxOf(playerState.cueIndex, 0)
+        shadowPhase = ShadowPhase.SCORING
+        scorer.start(cue.text)
+    }
+
+    /** Alternates the original audio with the learner's take, twice each way. */
+    fun playEcho() {
+        val cue = detail.cues.getOrNull(shadowIndex) ?: return
+        val take = shadowFile ?: return
+        if (echoActive) {
+            echoActive = false
+            return
+        }
+        echoActive = true
+        val cueDurationMs = ((cue.end - cue.start) * 1000).toLong().coerceIn(600L, 15_000L)
+        panelScope.launch {
+            repeat(2) {
+                if (!echoActive) return@launch
+                AudioEngine.setAbLoop((cue.start * 1000).toLong(), (cue.end * 1000).toLong())
+                AudioEngine.seekTo((cue.start * 1000).toLong())
+                AudioEngine.play()
+                delay(cueDurationMs + 300L)
+                if (!echoActive) return@launch
+                AudioEngine.pause()
+                recorder.play(take) { }
+                delay(cueDurationMs + 900L)
+            }
+            echoActive = false
+            AudioEngine.pause()
+        }
+    }
+
     val micPermission = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (granted) beginShadow() else onSnack("需要麦克风权限才能跟读")
+        when {
+            !granted -> onSnack("需要麦克风权限才能使用跟读与评分")
+            pendingMicAction == 1 -> beginShadow()
+            pendingMicAction == 2 -> startScoring()
+        }
     }
 
     DisposableEffect(Unit) {
-        onDispose { recorder.release() }
+        onDispose {
+            recorder.release()
+            scorer.release()
+        }
     }
 
     // Drives the three practice steps: listen to the model sentence, record your repeat, review it.
@@ -560,10 +635,12 @@ private fun PlayerPanel(
     }
 
     fun closeShadow() {
+        echoActive = false
         if (shadowPhase == ShadowPhase.RECORD) {
             shadowFile = recorder.stop()
         }
         recorder.stopPlayback()
+        scorer.reset()
         AudioEngine.suppressAutoAdvance(false)
         shadowPhase = ShadowPhase.IDLE
         shadowDialog = false
@@ -728,6 +805,13 @@ private fun PlayerPanel(
                                 },
                             )
                         }
+                        DropdownMenuItem(
+                            text = { Text("自定义速度…") },
+                            onClick = {
+                                speedMenu = false
+                                speedDialog = true
+                            },
+                        )
                     }
                 }
 
@@ -842,6 +926,58 @@ private fun PlayerPanel(
                 )
 
                 FilterChip(
+                    selected = isCurrent && playerState.volumeBoost,
+                    onClick = {
+                        if (!isCurrent) {
+                            onSnack("先播放课程，再开启人声增强")
+                        } else {
+                            AudioEngine.setVolumeBoost(!playerState.volumeBoost)
+                        }
+                    },
+                    label = { Text("人声增强") },
+                    leadingIcon = {
+                        Icon(Icons.Filled.VolumeUp, contentDescription = null, modifier = Modifier.size(16.dp))
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
+                )
+
+                Box {
+                    FilterChip(
+                        selected = isCurrent && playerState.repeatTarget > 0,
+                        onClick = { repeatMenu = true },
+                        label = {
+                            Text(
+                                if (playerState.repeatTarget > 0) "复读 ${playerState.repeatTarget} 遍" else "复读次数",
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        ),
+                    )
+                    DropdownMenu(expanded = repeatMenu, onDismissRequest = { repeatMenu = false }) {
+                        com.englishpod.learning.data.Settings.REPEAT_COUNTS.forEach { count ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (count == 0) "无限循环" else "复读 $count 遍后继续",
+                                        fontWeight = if (playerState.repeatTarget == count) FontWeight.SemiBold else FontWeight.Normal,
+                                    )
+                                },
+                                onClick = {
+                                    repeatMenu = false
+                                    AudioEngine.setRepeatCount(count)
+                                    if (playerState.loopMode != LoopMode.SENTENCE) {
+                                        onSnack("配合「单句循环」使用：每句读满遍数后自动下一句")
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+
+                FilterChip(
                     selected = false,
                     onClick = onAddNote,
                     label = { Text(if (noteCount > 0) "记笔记 ($noteCount)" else "记笔记") },
@@ -888,6 +1024,45 @@ private fun PlayerPanel(
         }
     }
 
+    if (speedDialog) {
+        AlertDialog(
+            onDismissRequest = { speedDialog = false },
+            title = { Text("自定义速度") },
+            text = {
+                Column {
+                    Text(
+                        text = "变速不变调，适合精听逐句抠细节。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "${"%.2f".format(speed)}×",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Slider(
+                        value = speed,
+                        onValueChange = { value ->
+                            val stepped = (value / 0.05f).toInt() * 0.05f
+                            if (isCurrent) {
+                                AudioEngine.setSpeed(stepped)
+                            } else {
+                                store.updateSettings { it.copy(speed = stepped) }
+                            }
+                        },
+                        valueRange = 0.5f..2f,
+                        steps = 29,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { speedDialog = false }) { Text("完成") }
+            },
+        )
+    }
+
     if (shadowDialog) {
         AlertDialog(
             onDismissRequest = { closeShadow() },
@@ -918,21 +1093,79 @@ private fun PlayerPanel(
                             ShadowPhase.IDLE -> "点「开始跟读」：原句会先播一遍"
                             ShadowPhase.LISTEN -> "① 正在播放原句，听完后自动开始录音"
                             ShadowPhase.RECORD -> "② ● 正在录音… 请跟着复述"
-                            ShadowPhase.REVIEW -> "③ 已录好，可以试听对比或重录"
+                            ShadowPhase.REVIEW -> "③ 已录好：可对比回放、发音评分，或重录"
+                            ShadowPhase.SCORING -> when (scorerState.phase) {
+                                com.englishpod.learning.player.SpeechScorer.ScoringState.Phase.LISTENING ->
+                                    "③ 正在听你朗读… 请对着原句再说一遍"
+                                com.englishpod.learning.player.SpeechScorer.ScoringState.Phase.DONE ->
+                                    "评分完成"
+                                else -> scorerState.error ?: "准备评分…"
+                            }
                         },
                         style = MaterialTheme.typography.labelMedium,
-                        color = if (shadowPhase == ShadowPhase.RECORD) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                        color = when {
+                            shadowPhase == ShadowPhase.RECORD -> MaterialTheme.colorScheme.error
+                            shadowPhase == ShadowPhase.SCORING &&
+                                scorerState.phase == com.englishpod.learning.player.SpeechScorer.ScoringState.Phase.DONE ->
+                                MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
                     )
+
+                    val score = scorerState.score
+                    if (shadowPhase == ShadowPhase.SCORING && score != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(12.dp),
+                        ) {
+                            Column {
+                                Text(
+                                    text = "发音准确率 ${(score.accuracy * 100).toInt()}%",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                androidx.compose.foundation.layout.FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    score.tokens.forEach { token ->
+                                        Text(
+                                            text = token.text,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = if (token.kind == com.englishpod.learning.core.TextDiff.Kind.MATCH) {
+                                                FontWeight.Normal
+                                            } else {
+                                                FontWeight.SemiBold
+                                            },
+                                            textDecoration = if (token.kind == com.englishpod.learning.core.TextDiff.Kind.MISSING) {
+                                                androidx.compose.ui.text.style.TextDecoration.LineThrough
+                                            } else {
+                                                androidx.compose.ui.text.style.TextDecoration.None
+                                            },
+                                            color = when (token.kind) {
+                                                com.englishpod.learning.core.TextDiff.Kind.MATCH -> MaterialTheme.colorScheme.onSurface
+                                                com.englishpod.learning.core.TextDiff.Kind.MISSING -> MaterialTheme.colorScheme.error
+                                                com.englishpod.learning.core.TextDiff.Kind.EXTRA -> Color(0xFFB45309)
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
                 val file = shadowFile
                 when (shadowPhase) {
                     ShadowPhase.IDLE -> TextButton(onClick = {
+                        pendingMicAction = 1
                         micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
                     }) {
                         Icon(
@@ -958,21 +1191,47 @@ private fun PlayerPanel(
                         Text("停止录音")
                     }
 
-                    ShadowPhase.REVIEW -> TextButton(onClick = {
-                        file?.let { recorder.play(it) { } }
-                    }) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    ShadowPhase.SCORING -> when (scorerState.phase) {
+                        com.englishpod.learning.player.SpeechScorer.ScoringState.Phase.LISTENING ->
+                            TextButton(onClick = { scorer.stopListening() }) { Text("停止") }
+                        com.englishpod.learning.player.SpeechScorer.ScoringState.Phase.DONE ->
+                            TextButton(onClick = { startScoring() }) { Text("再读一遍") }
+                        else -> TextButton(onClick = { startScoring() }) { Text("重试") }
+                    }
+
+                    ShadowPhase.REVIEW -> TextButton(onClick = { playEcho() }) {
+                        Icon(
+                            if (echoActive) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("试听我的")
+                        Text(if (echoActive) "停止对比" else "对比回放")
                     }
                 }
             },
             dismissButton = {
                 Row {
-                    if (shadowPhase == ShadowPhase.REVIEW) {
-                        TextButton(onClick = {
-                            micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
-                        }) { Text("重录") }
+                    when (shadowPhase) {
+                        ShadowPhase.REVIEW -> {
+                            if (scoringAvailable) {
+                                TextButton(onClick = {
+                                    pendingMicAction = 2
+                                    micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                                }) { Text("发音评分") }
+                            }
+                            TextButton(onClick = {
+                                pendingMicAction = 1
+                                micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+                            }) { Text("重录") }
+                        }
+                        ShadowPhase.SCORING -> {
+                            TextButton(onClick = {
+                                scorer.reset()
+                                shadowPhase = ShadowPhase.REVIEW
+                            }) { Text("返回") }
+                        }
+                        else -> Unit
                     }
                     TextButton(onClick = { closeShadow() }) { Text("关闭") }
                 }

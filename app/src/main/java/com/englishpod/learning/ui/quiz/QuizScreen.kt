@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Quiz
+import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Spellcheck
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.Button
@@ -47,9 +48,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,6 +61,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -66,24 +70,38 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavHostController
 import com.englishpod.learning.EnglishPodApp
+import com.englishpod.learning.core.DistractorPicker
 import com.englishpod.learning.core.Fmt
-import com.englishpod.learning.data.WordEntry
+import com.englishpod.learning.core.TextDiff
+import com.englishpod.learning.data.AudioSource
+import com.englishpod.learning.player.ClipPlayer
 import com.englishpod.learning.ui.components.EmptyState
 import com.englishpod.learning.ui.components.LevelChip
 import kotlinx.coroutines.launch
 
-private data class Question(val prompt: String, val answer: String, val options: List<String>)
+private data class Question(
+    val prompt: String,
+    val answer: String,
+    val options: List<String>,
+    /** Cloze question extras: the sentence with a blank plus its audio range. */
+    val sentence: String? = null,
+    val courseId: String? = null,
+    val startMs: Long? = null,
+    val endMs: Long? = null,
+    val wordKey: String? = null,
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun QuizScreen(navController: NavHostController, modeArg: String?) {
     val store = EnglishPodApp.store
     val repository = EnglishPodApp.repository
+    val context = LocalContext.current
     val courses by repository.courses.collectAsStateWithLifecycle()
     val words by store.wordbook.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
-    var mode by remember { mutableStateOf(if (modeArg == "spelling") 1 else 0) }
+    var mode by remember { mutableIntStateOf(if (modeArg == "spelling") 1 else 0) }
     var loading by remember { mutableStateOf(false) }
     var sourceLabel by remember { mutableStateOf<String?>(null) }
     var questions by remember { mutableStateOf<List<Question>?>(null) }
@@ -92,22 +110,35 @@ fun QuizScreen(navController: NavHostController, modeArg: String?) {
     var answered by remember { mutableStateOf<Boolean?>(null) }
     var typed by remember { mutableStateOf("") }
 
-    fun buildQuestions(pool: List<Pair<String, String>>, label: String) {
+    val clipPlayer = remember { ClipPlayer(context) }
+    val audioCache = remember { mutableStateMapOf<String, AudioSource>() }
+    DisposableEffect(Unit) {
+        onDispose { clipPlayer.release() }
+    }
+
+    suspend fun sourceFor(courseId: String): AudioSource? {
+        audioCache[courseId]?.let { return it }
+        val resolved = runCatching { repository.audioSource(courseId) }.getOrNull() ?: return null
+        audioCache[courseId] = resolved
+        return resolved
+    }
+
+    fun buildChoiceQuestions(pool: List<Pair<String, String>>, label: String) {
         val clean = pool
             .filter { it.first.isNotBlank() && it.second.isNotBlank() }
             .distinctBy { it.first.lowercase() }
         if (clean.size < 4) return
-        val picked = clean.shuffled()
-        questions = picked.take(10).map { entry ->
-            val distractors = clean
-                .filter { it.first != entry.first }
-                .shuffled()
-                .take(3)
-                .map { it.first }
+        questions = clean.shuffled().take(10).map { entry ->
             Question(
                 prompt = entry.second,
                 answer = entry.first,
-                options = (distractors + entry.first).shuffled(),
+                options = (
+                    DistractorPicker.pick(
+                        answer = entry.first,
+                        pool = clean.map { it.first },
+                        count = 3,
+                    ) + entry.first
+                    ).shuffled(),
             )
         }
         sourceLabel = label
@@ -117,24 +148,93 @@ fun QuizScreen(navController: NavHostController, modeArg: String?) {
         typed = ""
     }
 
-    fun startFromWordbook() {
-        buildQuestions(words.map { it.term to it.definition }, "生词本")
-    }
-
-    fun loadCourse(courseId: String, title: String) {
+    fun buildClozeQuestions(courseId: String, title: String) {
         loading = true
         questions = null
         scope.launch {
             runCatching { repository.detail(courseId) }
                 .onSuccess { detail ->
-                    buildQuestions(detail.vocabulary.map { it.term to it.definition }, title)
+                    val vocabTerms = detail.vocabulary.map { it.term.trim() }
+                    val wordbookTerms = words.map { it.term.trim() }
+                    val targetTerms = buildList {
+                        // Words the learner is actively studying come first.
+                        addAll(wordbookTerms.filter { it.isNotBlank() }.shuffled())
+                        addAll(vocabTerms.shuffled())
+                    }.distinctBy { it.lowercase() }
+
+                    val built = mutableListOf<Question>()
+                    val usedCues = mutableSetOf<Int>()
+                    for (term in targetTerms) {
+                        if (built.size >= 10) break
+                        if (term.length < 2) continue
+                        val cueIndex = detail.cues.indexOfFirst { cue ->
+                            val idx = usedCues.indexOfFirst { used -> detail.cues[used].start == cue.start }
+                            TextDiff.words(cue.text).any { it == TextDiff.normalize(term) } && idx < 0
+                        }
+                        if (cueIndex < 0) continue
+                        val cue = detail.cues[cueIndex]
+                        usedCues.add(cueIndex)
+                        val regex = Regex("\\b${Regex.escape(term)}\\b", RegexOption.IGNORE_CASE)
+                        if (!regex.containsMatchIn(cue.text)) continue
+                        val pool = (vocabTerms + wordbookTerms).distinct()
+                        val options = (
+                            DistractorPicker.pick(answer = term, pool = pool, count = 3) + term
+                            ).shuffled()
+                        built.add(
+                            Question(
+                                prompt = cue.text.replace(regex, "______"),
+                                answer = term,
+                                options = options,
+                                sentence = cue.text,
+                                courseId = detail.id,
+                                startMs = (cue.start * 1000).toLong(),
+                                endMs = (cue.end * 1000).toLong(),
+                                wordKey = term.trim().lowercase(),
+                            ),
+                        )
+                    }
+                    if (built.size >= 3) {
+                        questions = built
+                        sourceLabel = title
+                        index = 0
+                        score = 0
+                        answered = null
+                        typed = ""
+                    } else {
+                        sourceLabel = null
+                    }
                 }
-                .onFailure { sourceLabel = null }
             loading = false
         }
     }
 
+    fun startFromWordbook() {
+        buildChoiceQuestions(words.map { it.term to it.definition }, "生词本")
+    }
+
     val quiz = questions
+    val current = quiz?.getOrNull(index)
+
+    // Cloze questions auto-play their sentence once when shown.
+    LaunchedEffect(current?.id()) {
+        val question = current ?: return@LaunchedEffect
+        if (question.sentence != null && question.courseId != null && question.startMs != null) {
+            val source = sourceFor(question.courseId) ?: return@LaunchedEffect
+            clipPlayer.play(source, question.startMs, question.endMs)
+        }
+    }
+
+    fun replayCurrent() {
+        val question = current ?: return
+        scope.launch {
+            val source = question.courseId?.let { sourceFor(it) } ?: return@launch
+            if (clipPlayer.playing.value) {
+                clipPlayer.replay()
+            } else {
+                clipPlayer.play(source, question.startMs ?: 0L, question.endMs)
+            }
+        }
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -167,7 +267,11 @@ fun QuizScreen(navController: NavHostController, modeArg: String?) {
             )
         },
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
             when {
                 loading -> Box(
                     modifier = Modifier.fillMaxSize(),
@@ -180,7 +284,23 @@ fun QuizScreen(navController: NavHostController, modeArg: String?) {
                     wordCount = words.size,
                     courses = courses,
                     onWordbook = ::startFromWordbook,
-                    onCourse = { id, title -> loadCourse(id, title) },
+                    onCourse = { id, title ->
+                        when (mode) {
+                            2 -> buildClozeQuestions(id, title)
+                            else -> scope.launch {
+                                loading = true
+                                questions = null
+                                runCatching { repository.detail(id) }
+                                    .onSuccess { detail ->
+                                        buildChoiceQuestions(
+                                            detail.vocabulary.map { it.term to it.definition },
+                                            title,
+                                        )
+                                    }
+                                loading = false
+                            }
+                        }
+                    },
                 )
 
                 index >= quiz.size -> ResultPane(
@@ -189,40 +309,47 @@ fun QuizScreen(navController: NavHostController, modeArg: String?) {
                     onRetry = { questions = null },
                 )
 
-                else -> {
-                    val question = quiz[index]
-                    QuestionPane(
-                        mode = mode,
-                        question = question,
-                        index = index,
-                        total = quiz.size,
-                        score = score,
-                        answered = answered,
-                        typed = typed,
-                        onTypedChange = { typed = it },
-                        onSubmitChoice = { option ->
-                            if (answered == null) {
-                                answered = option.equals(question.answer, ignoreCase = true)
-                                if (answered == true) score += 1
+                current != null -> QuestionPane(
+                    mode = mode,
+                    question = current,
+                    index = index,
+                    total = quiz.size,
+                    score = score,
+                    answered = answered,
+                    typed = typed,
+                    playing = clipPlayer.playing.collectAsStateWithLifecycle().value,
+                    onTypedChange = { typed = it },
+                    onReplay = { replayCurrent() },
+                    onSubmitChoice = { option ->
+                        if (answered == null) {
+                            answered = option.equals(current.answer, ignoreCase = true)
+                            if (answered == true) {
+                                score += 1
+                            } else if (mode == 2 && current.wordKey != null) {
+                                // Missed a listening cloze: straight back into review.
+                                scope.launch { store.gradeWord(current.wordKey, com.englishpod.learning.data.ReviewGrade.AGAIN) }
                             }
-                        },
-                        onSubmitSpelling = {
-                            if (answered == null) {
-                                answered = typed.trim().equals(question.answer.trim(), ignoreCase = true)
-                                if (answered == true) score += 1
-                            }
-                        },
-                        onNext = {
-                            index += 1
-                            answered = null
-                            typed = ""
-                        },
-                    )
-                }
+                        }
+                    },
+                    onSubmitSpelling = {
+                        if (answered == null) {
+                            answered = typed.trim().equals(current.answer.trim(), ignoreCase = true)
+                            if (answered == true) score += 1
+                        }
+                    },
+                    onNext = {
+                        index += 1
+                        answered = null
+                        typed = ""
+                        clipPlayer.stop()
+                    },
+                )
             }
         }
     }
 }
+
+private fun Question.id(): String = "$courseId-$startMs-$answer"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -251,7 +378,62 @@ private fun QuizPicker(
                     onClick = { onModeChange(1) },
                     text = { Text("看释义拼单词") },
                 )
+                Tab(
+                    selected = mode == 2,
+                    onClick = { onModeChange(2) },
+                    text = { Text("听力填空") },
+                )
             }
+        }
+
+        if (mode == 2) {
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "听句子，填出空格里的词",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "从课程句子自动出题，挖掉生词或课程词汇；答错的词会自动进入复习队列。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                        )
+                    }
+                }
+            }
+            item {
+                Text(
+                    text = "选择一节课",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            if (courses.isEmpty()) {
+                item {
+                    EmptyState(
+                        icon = Icons.Filled.Quiz,
+                        title = "课程列表为空",
+                        subtitle = "请先联网加载课程列表，再回来做测验。",
+                    )
+                }
+            } else {
+                items(courses, key = { it.id }) { course ->
+                    CourseRow(course = course, modeIcon = Icons.Filled.Quiz) {
+                        onCourse(course.id, course.title)
+                    }
+                }
+            }
+            return@LazyColumn
         }
 
         item {
@@ -326,44 +508,58 @@ private fun QuizPicker(
             }
         } else {
             items(courses, key = { it.id }) { course ->
-                Card(
-                    onClick = { onCourse(course.id, course.title) },
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-                    modifier = Modifier.fillMaxWidth(),
+                CourseRow(
+                    course = course,
+                    modeIcon = if (mode == 0) Icons.Filled.Translate else Icons.Filled.Spellcheck,
                 ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = course.title,
-                                style = MaterialTheme.typography.titleSmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                LevelChip(course.level)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "${course.noteCount} 词 · ${Fmt.shortDuration(course.duration)}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        Icon(
-                            if (mode == 0) Icons.Filled.Translate else Icons.Filled.Spellcheck,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(20.dp),
-                        )
-                    }
+                    onCourse(course.id, course.title)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun CourseRow(
+    course: com.englishpod.learning.data.Course,
+    modeIcon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: () -> Unit,
+) {
+    Card(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = course.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    LevelChip(course.level)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${course.noteCount} 词 · ${Fmt.shortDuration(course.duration)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Icon(
+                modeIcon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
 }
@@ -377,7 +573,9 @@ private fun QuestionPane(
     score: Int,
     answered: Boolean?,
     typed: String,
+    playing: Boolean,
     onTypedChange: (String) -> Unit,
+    onReplay: () -> Unit,
     onSubmitChoice: (String) -> Unit,
     onSubmitSpelling: () -> Unit,
     onNext: () -> Unit,
@@ -414,25 +612,70 @@ private fun QuestionPane(
             ),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Column(modifier = Modifier.padding(20.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Text(
-                    text = if (mode == 0) "选出对应的英文单词" else "根据释义拼写英文单词",
+                    text = when (mode) {
+                        0 -> "选出对应的英文单词"
+                        1 -> "根据释义拼写英文单词"
+                        else -> "听句子，选出空格里的词"
+                    },
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
                 )
                 Spacer(modifier = Modifier.height(10.dp))
+                if (mode == 2) {
+                    IconButton(onClick = onReplay) {
+                        Icon(
+                            Icons.Filled.Replay,
+                            contentDescription = "重播句子",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(34.dp),
+                        )
+                    }
+                    if (playing) {
+                        Text(
+                            text = "播放中…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                        )
+                    }
+                }
                 Text(
                     text = question.prompt,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    textAlign = TextAlign.Center,
                 )
             }
         }
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        if (mode == 0) {
+        if (mode == 1) {
+            OutlinedTextField(
+                value = typed,
+                onValueChange = onTypedChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("输入英文单词") },
+                singleLine = true,
+                enabled = answered == null,
+                shape = RoundedCornerShape(14.dp),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { onSubmitSpelling() }),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            if (answered == null) {
+                Button(onClick = onSubmitSpelling, modifier = Modifier.fillMaxWidth()) {
+                    Text("提交答案")
+                }
+            }
+        } else {
             question.options.forEach { option ->
                 val isAnswer = option.equals(question.answer, ignoreCase = true)
                 val background = when {
@@ -467,24 +710,6 @@ private fun QuestionPane(
                     }
                 }
             }
-        } else {
-            OutlinedTextField(
-                value = typed,
-                onValueChange = onTypedChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("输入英文单词") },
-                singleLine = true,
-                enabled = answered == null,
-                shape = RoundedCornerShape(14.dp),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { onSubmitSpelling() }),
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            if (answered == null) {
-                Button(onClick = onSubmitSpelling, modifier = Modifier.fillMaxWidth()) {
-                    Text("提交答案")
-                }
-            }
         }
 
         if (answered != null) {
@@ -500,21 +725,28 @@ private fun QuestionPane(
                 ),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        if (answered == true) Icons.Filled.Check else Icons.Filled.Close,
-                        contentDescription = null,
-                        tint = if (answered == true) Color(0xFF0F766E) else MaterialTheme.colorScheme.error,
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = if (answered == true) "回答正确！" else "正确答案：${question.answer}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            if (answered == true) Icons.Filled.Check else Icons.Filled.Close,
+                            contentDescription = null,
+                            tint = if (answered == true) Color(0xFF0F766E) else MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = if (answered == true) "回答正确！" else "正确答案：${question.answer}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    if (mode == 2 && !question.sentence.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "原文：${question.sentence}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(12.dp))
